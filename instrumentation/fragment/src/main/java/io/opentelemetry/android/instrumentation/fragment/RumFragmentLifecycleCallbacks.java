@@ -13,25 +13,25 @@ import androidx.annotation.Nullable;
 import androidx.fragment.app.Fragment;
 import androidx.fragment.app.FragmentManager;
 import io.opentelemetry.android.common.ActiveSpan;
-import io.opentelemetry.android.instrumentation.activity.VisibleScreenTracker;
 import io.opentelemetry.android.instrumentation.common.ScreenNameExtractor;
 import io.opentelemetry.api.trace.Tracer;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.function.Supplier;
 
 public class RumFragmentLifecycleCallbacks extends FragmentManager.FragmentLifecycleCallbacks {
     private final Map<String, FragmentTracer> tracersByFragmentClassName = new HashMap<>();
 
     private final Tracer tracer;
-    private final VisibleScreenTracker visibleScreenTracker;
+    private final Supplier<String> lastVisibleScreen;
     private final ScreenNameExtractor screenNameExtractor;
 
     public RumFragmentLifecycleCallbacks(
             Tracer tracer,
-            VisibleScreenTracker visibleScreenTracker,
+            Supplier<String> lastVisibleScreen,
             ScreenNameExtractor screenNameExtractor) {
         this.tracer = tracer;
-        this.visibleScreenTracker = visibleScreenTracker;
+        this.lastVisibleScreen = lastVisibleScreen;
         this.screenNameExtractor = screenNameExtractor;
     }
 
@@ -87,13 +87,11 @@ public class RumFragmentLifecycleCallbacks extends FragmentManager.FragmentLifec
                 .addEvent("fragmentResumed")
                 .addPreviousScreenAttribute()
                 .endActiveSpan();
-        visibleScreenTracker.fragmentResumed(f);
     }
 
     @Override
     public void onFragmentPaused(@NonNull FragmentManager fm, @NonNull Fragment f) {
         super.onFragmentPaused(fm, f);
-        visibleScreenTracker.fragmentPaused(f);
         getTracer(f).startSpanIfNoneInProgress("Paused").addEvent("fragmentPaused");
     }
 
@@ -152,9 +150,7 @@ public class RumFragmentLifecycleCallbacks extends FragmentManager.FragmentLifec
                     FragmentTracer.builder(fragment)
                             .setTracer(tracer)
                             .setScreenName(screenNameExtractor.extract(fragment))
-                            .setActiveSpan(
-                                    new ActiveSpan(
-                                            visibleScreenTracker::getPreviouslyVisibleScreen))
+                            .setActiveSpan(new ActiveSpan(lastVisibleScreen))
                             .build();
             tracersByFragmentClassName.put(fragment.getClass().getName(), activityTracer);
         }

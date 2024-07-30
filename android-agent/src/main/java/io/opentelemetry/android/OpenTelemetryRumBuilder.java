@@ -8,22 +8,17 @@ package io.opentelemetry.android;
 import static java.util.Objects.requireNonNull;
 
 import android.app.Application;
-import android.content.Context;
 import android.util.Log;
 import io.opentelemetry.android.common.RumConstants;
 import io.opentelemetry.android.config.OtelRumConfig;
 import io.opentelemetry.android.features.diskbuffering.DiskBufferingConfiguration;
 import io.opentelemetry.android.features.diskbuffering.SignalFromDiskExporter;
 import io.opentelemetry.android.features.diskbuffering.scheduler.ExportScheduleHandler;
-import io.opentelemetry.android.instrumentation.activity.VisibleScreenTracker;
 import io.opentelemetry.android.instrumentation.common.InstrumentedApplication;
-import io.opentelemetry.android.instrumentation.crash.CrashReporter;
-import io.opentelemetry.android.instrumentation.crash.CrashReporterBuilder;
-import io.opentelemetry.android.instrumentation.startup.InitializationEvents;
-import io.opentelemetry.android.instrumentation.startup.SdkInitializationEvents;
 import io.opentelemetry.android.internal.features.networkattrs.NetworkAttributesSpanAppender;
 import io.opentelemetry.android.internal.features.persistence.DiskManager;
 import io.opentelemetry.android.internal.features.persistence.SimpleTemporaryFileProvider;
+import io.opentelemetry.android.internal.initialization.InitializationEvents;
 import io.opentelemetry.android.internal.processors.GlobalAttributesLogRecordAppender;
 import io.opentelemetry.android.internal.services.CacheStorage;
 import io.opentelemetry.android.internal.services.Preferences;
@@ -55,9 +50,7 @@ import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
 import io.opentelemetry.sdk.trace.export.SpanExporter;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -81,7 +74,6 @@ public final class OpenTelemetryRumBuilder {
     private final List<BiFunction<SdkLoggerProviderBuilder, Application, SdkLoggerProviderBuilder>>
             loggerProviderCustomizers = new ArrayList<>();
     private final OtelRumConfig config;
-    private final VisibleScreenTracker visibleScreenTracker = new VisibleScreenTracker();
 
     private final List<Consumer<InstrumentedApplication>> instrumentationInstallers =
             new ArrayList<>();
@@ -94,8 +86,6 @@ public final class OpenTelemetryRumBuilder {
             (a) -> a;
 
     private Resource resource;
-    private InitializationEvents initializationEvents = InitializationEvents.NO_OP;
-    private Consumer<CrashReporterBuilder> crashReporterCustomizer = x -> {};
 
     private static TextMapPropagator buildDefaultPropagator() {
         return TextMapPropagator.composite(
@@ -151,21 +141,6 @@ public final class OpenTelemetryRumBuilder {
             BiFunction<SdkTracerProviderBuilder, Application, SdkTracerProviderBuilder>
                     customizer) {
         tracerProviderCustomizers.add(customizer);
-        return this;
-    }
-
-    /**
-     * Pass a Consumer that will receive the CrashReporterBuilder in order to perform additional
-     * specific customizations. If crash reporting is disabled via config, this method is
-     * effectively a no-op.
-     *
-     * @param customizer A Consumer that will recieve the {@link CrashReporterBuilder} before the
-     *     {@link CrashReporter} is built.
-     * @return this.
-     */
-    public OpenTelemetryRumBuilder addCrashReportingCustomization(
-            Consumer<CrashReporterBuilder> customizer) {
-        this.crashReporterCustomizer = customizer;
         return this;
     }
 
@@ -298,7 +273,8 @@ public final class OpenTelemetryRumBuilder {
     }
 
     OpenTelemetryRum build(ServiceManager serviceManager) {
-        applyConfiguration();
+        InitializationEvents initializationEvents = InitializationEvents.get();
+        applyConfiguration(serviceManager, initializationEvents);
 
         DiskBufferingConfiguration diskBufferingConfiguration =
                 config.getDiskBufferingConfiguration();
@@ -395,18 +371,10 @@ public final class OpenTelemetryRumBuilder {
     }
 
     /** Leverage the configuration to wire up various instrumentation components. */
-    private void applyConfiguration() {
+    private void applyConfiguration(
+            ServiceManager serviceManager, InitializationEvents initializationEvents) {
         if (config.shouldGenerateSdkInitializationEvents()) {
-            if (initializationEvents == InitializationEvents.NO_OP) {
-                SdkInitializationEvents sdkInitEvents = new SdkInitializationEvents();
-                addOtelSdkReadyListener(sdkInitEvents::finish);
-                initializationEvents = sdkInitEvents;
-            }
-            Map<String, String> configMap = new HashMap<>();
-            // TODO: Convert config to map
-            // breedx-splk: Left incomplete for now, because I think Cesar is making changes around
-            // this
-            initializationEvents.recordConfiguration(configMap);
+            initializationEvents.recordConfiguration(config);
         }
         initializationEvents.sdkInitializationStarted();
 
@@ -427,7 +395,7 @@ public final class OpenTelemetryRumBuilder {
                     (tracerProviderBuilder, app) -> {
                         SpanProcessor networkAttributesSpanAppender =
                                 NetworkAttributesSpanAppender.create(
-                                        ServiceManager.get().getCurrentNetworkProvider());
+                                        serviceManager.getCurrentNetworkProvider());
                         return tracerProviderBuilder.addSpanProcessor(
                                 networkAttributesSpanAppender);
                     });
@@ -439,25 +407,9 @@ public final class OpenTelemetryRumBuilder {
             addTracerProviderCustomizer(
                     (tracerProviderBuilder, app) -> {
                         SpanProcessor screenAttributesAppender =
-                                new ScreenAttributesSpanProcessor(visibleScreenTracker);
+                                new ScreenAttributesSpanProcessor(
+                                        serviceManager.getVisibleScreenService());
                         return tracerProviderBuilder.addSpanProcessor(screenAttributesAppender);
-                    });
-        }
-
-        // Enable crash reporting instrumentation
-        if (config.isCrashReportingEnabled()) {
-            addInstrumentation(
-                    instrumentedApplication -> {
-                        Context context =
-                                instrumentedApplication.getApplication().getApplicationContext();
-                        CrashReporterBuilder builder =
-                                CrashReporter.builder()
-                                        .addAttributesExtractor(
-                                                RuntimeDetailsExtractor.create(context));
-                        crashReporterCustomizer.accept(builder);
-                        builder.build().installOn(instrumentedApplication);
-
-                        initializationEvents.crashReportingInitialized();
                     });
         }
     }
@@ -521,10 +473,5 @@ public final class OpenTelemetryRumBuilder {
     private ContextPropagators buildFinalPropagators() {
         TextMapPropagator defaultPropagator = buildDefaultPropagator();
         return ContextPropagators.create(propagatorCustomizer.apply(defaultPropagator));
-    }
-
-    OpenTelemetryRumBuilder setInitializationEvents(InitializationEvents initializationEvents) {
-        this.initializationEvents = initializationEvents;
-        return this;
     }
 }
